@@ -7,7 +7,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from dolfinx import fem
 
 class GeodesicShell:
-    def __init__(self, stl_path, tolerance=1e-6):
+    def __init__(self, stl_path, tolerance=3.5e-3):
         # Load STL
         mesh = trimesh.load_mesh(stl_path)
         self.mesh = mesh
@@ -40,7 +40,7 @@ class GeodesicShell:
             np.isclose(pts_array[:, 1], 0, atol=tol) |  # Y=0
             np.isclose(pts_array[:, 2], 0, atol=tol) |  # Z=0
             np.isclose(pts_array[:, 2], pts_array[:, 2].max(), atol=tol) |  # Top
-            np.isclose(pts_array[:, 2], pts_array[:, 2].min(), atol=tol)     # Bottom
+            np.isclose(pts_array[:, 2], pts_array[:, 2].min() + 0.01, atol=tol) # Bottom
         ]
         return aligned_pts
 
@@ -87,7 +87,7 @@ class GeodesicShell:
         """
         Subdivide a single edge by inserting a midpoint
         edge_idx: index in self.edges
-        Returns new point index
+        Returns new point index, and the two new edges created
         """
         a_idx, b_idx = self.edges[edge_idx]
         a = self.points[a_idx]
@@ -99,15 +99,17 @@ class GeodesicShell:
         # Replace old edge with two new edges
         self.edges.append((a_idx, new_idx))
         self.edges.append((new_idx, b_idx))
-        return new_idx
+        return new_idx, (a_idx, new_idx), (new_idx, b_idx)
 
-    def subdivide_edge_to_vertex(self, edge_idx, target_idx, num_subdiv=3):
+    def subdivide_edge_to_vertex(self, edge_idx, target_idx, num_subdiv=3, full_edge=False):
         """
         Create a curve from edge midpoint to another vertex (like a geodesic strut)
         """
         a_idx, b_idx = self.edges[edge_idx]
         a = self.points[a_idx]
         b = self.points[b_idx]
+        if full_edge:
+            a, b = self.find_closest_corners(edge_idx)
         target = self.points[target_idx]
 
         # Start with midpoint of edge
@@ -139,7 +141,7 @@ class GeodesicShell:
 
         return [idx for idx, _ in new_edge_list]
     
-    def split_edge_multiple_to_vertex(self, edge_idx, target_idx, num_splits=3, num_subdiv=3):
+    def split_edge_multiple_to_vertex(self, edge_idx, target_idx, num_splits=3, num_subdiv=3, full_edge=False):
         """
         Split an edge into multiple segments and create struts to the target vertex,
         each strut subdivided into num_subdiv intermediate points
@@ -147,6 +149,8 @@ class GeodesicShell:
         a_idx, b_idx = self.edges[edge_idx]
         a = self.points[a_idx]
         b = self.points[b_idx]
+        if full_edge:
+            a, b = self.find_closest_corners(edge_idx)
         target = self.points[target_idx]
 
         # Create split points along the edge (evenly spaced)
@@ -205,6 +209,38 @@ class GeodesicShell:
         closest_points, _, _ = trimesh.proximity.closest_point(self.mesh, self.points)
         self.points = closest_points
 
+    def find_closest_corners(self, edge_idx):
+        """
+        Find the closest corners (vertex with valence 2) to the endpoints of the edge.
+        """
+        a_idx, b_idx = self.edges[edge_idx]
+        def find_closest_corner(start_idx):
+            visited = set()
+            current_idx = start_idx
+            while True:
+                visited.add(current_idx)
+                # Get connected edges
+                connected_edges = [e for e in self.edges if current_idx in e]
+                if len(connected_edges) == 2:
+                    return current_idx  # Found a corner
+                # Move to the next vertex along an edge
+                next_idx = None
+                for e in connected_edges:
+                    if e[0] == current_idx and e[1] not in visited:
+                        next_idx = e[1]
+                        break
+                    elif e[1] == current_idx and e[0] not in visited:
+                        next_idx = e[0]
+                        break
+                if next_idx is None:
+                    return current_idx  # No more vertices to visit, return last one
+                current_idx = next_idx
+
+        corner_a = find_closest_corner(a_idx)
+        corner_b = find_closest_corner(b_idx)
+        return self.points[corner_a], self.points[corner_b]
+
+
     def add_thickness(self, thickness=2.0):
         """
         Add uniform thickness along vertex normals.
@@ -214,6 +250,14 @@ class GeodesicShell:
         outer = self.points + 0.5 * thickness * normals
         inner = self.points - 0.5 * thickness * normals
         return outer, inner
+    
+
+    def add_edge(self, a_idx, b_idx):
+        """
+        Add an edge between two existing vertices
+        """
+        self.edges.append((a_idx, b_idx))
+        return len(self.edges) - 1  # Return index of new edge
 
 def plot_geodesic_shell(shell, show_points=True, show_edges=True, show_boundary=True):
     """
@@ -230,9 +274,9 @@ def plot_geodesic_shell(shell, show_points=True, show_edges=True, show_boundary=
     boundary_nodes = shell.boundary_nodes
 
     # Plot points
-    if show_points:
-        ax.scatter(points[:, 0], points[:, 1], points[:, 2],
-                   color='red', s=20, alpha=0.8, label='Vertices')
+    # if show_points:
+    #     ax.scatter(points[:, 0], points[:, 1], points[:, 2],
+    #                color='red', s=20, alpha=0.8, label='Vertices')
 
     # Plot edges
     if show_edges:
@@ -257,10 +301,14 @@ def plot_geodesic_shell(shell, show_points=True, show_edges=True, show_boundary=
     plt.show()
 
 if __name__ == "__main__":
-    shell = GeodesicShell("Tibia.stl")
+    shell = GeodesicShell("Tibia_Cut.stl")
+
+    # edge1 = shell.add_edge(0, 1)  # Example of adding an edge between two vertices
+    # shell.subdivide_edge(edge1)
+    # shell.project_points_to_surface()
 
     print(len(shell.points), "points")
     print(len(shell.edges), "edges")
     print(len(shell.boundary_nodes), "boundary nodes")
 
-    # plot_geodesic_shell(shell)
+    plot_geodesic_shell(shell)

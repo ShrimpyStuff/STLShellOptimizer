@@ -1,6 +1,5 @@
 import numpy as np
 import trimesh
-import os
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -8,29 +7,10 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from dolfinx import fem
 
 class GeodesicShell:
-    def __init__(
-        self,
-        stl_path,
-        tolerance=2e-3,
-        num_layers=8,
-        points_per_layer=12,
-        edge_subdivisions=5,
-        triangle_span=2,
-        layer_stagger_fraction=0.0,
-        connectivity_stagger_fraction=0.5,
-    ):
+    def __init__(self, stl_path, tolerance=3e-3):
         # Load STL
         mesh = trimesh.load_mesh(stl_path)
         self.mesh = mesh
-        self.tolerance = tolerance
-        
-        # Prism parameters
-        self.num_layers = num_layers
-        self.points_per_layer = points_per_layer
-        self.edge_subdivisions = edge_subdivisions
-        self.triangle_span = triangle_span
-        self.layer_stagger_fraction = layer_stagger_fraction
-        self.connectivity_stagger_fraction = connectivity_stagger_fraction
 
         # Center mesh at origin
         center = mesh.bounds.mean(axis=0)
@@ -38,164 +18,63 @@ class GeodesicShell:
 
         # Original vertices and faces
         self.vertices = mesh.vertices
-        self.mesh_faces = mesh.faces
+        self.faces = mesh.faces
         self.vertex_normals = mesh.vertex_normals
 
-        # Generate outer boundary of trapezoidal prism
-        self.points = self._generate_prism_boundary(
-            num_layers=num_layers, points_per_layer=points_per_layer
-        )
-        
-        # Build triangular faces for prism shell
-        self.faces = self._build_prism_faces()
-        
-        # Extract edges from faces
-        self.edges = self._extract_edges_from_faces()
-        
-        # Project the entire prism onto the mesh surface with edge subdivision
-        self._project_to_surface(num_segments=edge_subdivisions)
+        # Simplify points along X, Y, Z axes + top/bottom layers
+        pts_array = self._select_aligned_points(tolerance)
+        # pts_array = self.vertices  # For now, use all vertices
+        self.points, self.point_idx_map = self._unique_vertices(pts_array)
+
+        # Build edges between selected points
+        self.edges = self._build_edges()
         
         # Identify boundary nodes (edges that appear only once)
         self.boundary_nodes = self._find_boundary_nodes()
+
         self.full_edges = self._full_edges()
 
-    def _generate_prism_boundary(self, num_layers=8, points_per_layer=12):
-        """
-        Generate only the outer boundary points of a prism.
-        Creates a loop of points at each Z layer, forming the outer shell.
-        num_layers: number of horizontal layers (Z direction)
-        points_per_layer: number of points around each layer's perimeter
-        """
-        bounds = self.mesh.bounds
-        x_min, y_min, z_min = bounds[0]
-        x_max, y_max, z_max = bounds[1]
-        
-        # Add small inset to avoid exact boundary
-        inset = 0.01
-        x_min += inset
-        x_max -= inset
-        y_min += inset
-        y_max -= inset
-        z_min += inset
-        z_max -= inset
-        
-        x_center = (x_min + x_max) / 2
-        y_center = (y_min + y_max) / 2
-        
-        # Calculate radius for the perimeter loop
-        x_radius = (x_max - x_min) / 2
-        y_radius = (y_max - y_min) / 2
-        
-        points = []
-        
-        # Generate points layer by layer (Z direction)
-        for iz in range(num_layers):
-            z = z_min + (z_max - z_min) * iz / (num_layers - 1) if num_layers > 1 else (z_min + z_max) / 2
-            
-            # Create a loop of points around the perimeter at this Z level
-            for ip in range(points_per_layer):
-                angle = 2 * np.pi * ip / points_per_layer
-                x = x_center + x_radius * np.cos(angle)
-                y = y_center + y_radius * np.sin(angle)
-                points.append([x, y, z])
-        
-        return np.array(points)
+        self.add_close_edges()
 
-    def _project_to_surface(self, num_segments=5):
-        """
-        Project all prism points onto the mesh surface.
-        Subdivide edges with intermediate points for better surface conformance.
-        Triangular faces remain intact for later geodesic subdivision.
-        """
-        # First, project all existing points
-        projected_points, _, _ = trimesh.proximity.closest_point(self.mesh, self.points)
-        self.points = projected_points
-        
-        # Then subdivide edges and project intermediate points
-        new_edges = []
-        new_points_list = []
-        
-        for edge in self.edges:
-            a_idx, b_idx = edge
-            a = self.points[a_idx]
-            b = self.points[b_idx]
-            
-            # Create subdivided path along the edge
-            segment_indices = [a_idx]
-            
-            for i in range(1, num_segments):
-                t = i / num_segments
-                interp_pt = a * (1 - t) + b * t
-                # Project to surface
-                proj_pt, _, _ = trimesh.proximity.closest_point(self.mesh, interp_pt.reshape(1, 3))
-                new_points_list.append(proj_pt[0])
-                segment_indices.append(len(self.points) + len(new_points_list) - 1)
-            
-            segment_indices.append(b_idx)
-            
-            # Create edges between consecutive points in the subdivided path
-            for i in range(len(segment_indices) - 1):
-                new_edges.append((segment_indices[i], segment_indices[i + 1]))
-        
-        # Add new points and replace edges
-        if new_points_list:
-            self.points = np.vstack([self.points, np.array(new_points_list)])
-        self.edges = new_edges
+        self.boundary_nodes = self._find_boundary_nodes()
 
-    def _build_prism_faces(self):
-        """
-        Build a geodesic-like strip between adjacent layers.
-        triangle_span defines the base width (in ring-index steps), and the
-        opposite vertex is placed at the midpoint index on the other layer.
-        """
-        faces = []
-        
-        # Calculate points per layer
-        ppl = self.points_per_layer
-        num_layers = self.num_layers
-        # Enforce an even span so a midpoint index exists.
-        span = max(2, int(self.triangle_span))
-        if span % 2 != 0:
-            span += 1
-        half = span // 2
-        
-        # Create triangular faces between adjacent layers
-        # Stagger connectivity by band while keeping ring geometry aligned.
-        for layer in range(num_layers - 1):
-            lower_base = layer * ppl
-            upper_base = (layer + 1) * ppl
-            band_shift = int(round(layer * self.connectivity_stagger_fraction * span)) % ppl
-            
-            for i in range(ppl):
-                j = (i + band_shift) % ppl
+    def _select_aligned_points(self, tol):
+        # Select points aligned with axes and top/bottom planes
+        pts_array = self.vertices
+        aligned_pts = pts_array[
+            np.isclose(pts_array[:, 0], 0, atol=tol) & ~np.isclose(pts_array[:, 2], pts_array[:, 2].min(), atol=tol) |  # X=0
+            np.isclose(pts_array[:, 1], 0, atol=tol) & ~np.isclose(pts_array[:, 2], pts_array[:, 2].min(), atol=tol) |  # Y=0
+            np.isclose(pts_array[:, 2], 0, atol=tol) & ~np.isclose(pts_array[:, 2], pts_array[:, 2].min(), atol=tol) |  # Z=0
+            np.isclose(pts_array[:, 2], pts_array[:, 2].max() - 0.01, atol=tol) |  # Top
+            np.isclose(pts_array[:, 2], pts_array[:, 2].min() + 0.01, atol=tol) # Bottom
+        ]
+        return aligned_pts
 
-                # Alternate orientation by index to avoid overlapping triangles.
-                if i % 2 == 0:
-                    # Base on lower layer, apex at midpoint on upper layer.
-                    lower_a = lower_base + j
-                    lower_b = lower_base + ((j + span) % ppl)
-                    upper_mid = upper_base + ((j + half) % ppl)
-                    faces.append((lower_a, lower_b, upper_mid))
-                else:
-                    # Base on upper layer, apex at midpoint on lower layer.
-                    upper_a = upper_base + j
-                    upper_b = upper_base + ((j + span) % ppl)
-                    lower_mid = lower_base + ((j + half) % ppl)
-                    faces.append((upper_a, lower_mid, upper_b))
-        
-        return faces
-    
-    def _extract_edges_from_faces(self):
-        """
-        Extract unique edges directly from triangular faces.
-        """
+    def _unique_vertices(self, pts_array):
+        # Deduplicate vertices
+        unique_pts, inverse_indices = np.unique(pts_array, axis=0, return_inverse=True)
+        # Map original tuple -> index
+        point_idx_map = {tuple(p): i for i, p in enumerate(unique_pts)}
+        return unique_pts, point_idx_map
+
+    def _build_edges(self):
+        # Build edges from faces, keep only edges between selected points
         edges_set = set()
+        point_tuples = set(map(tuple, self.points))
         for face in self.faces:
-            edges_set.add(tuple(sorted([face[0], face[1]])))
-            edges_set.add(tuple(sorted([face[1], face[2]])))
-            edges_set.add(tuple(sorted([face[2], face[0]])))
-        
-        return list(edges_set)
+            verts = self.vertices[face]
+            face_edges = [
+                (tuple(verts[0]), tuple(verts[1])),
+                (tuple(verts[1]), tuple(verts[2])),
+                (tuple(verts[2]), tuple(verts[0]))
+            ]
+            for a, b in face_edges:
+                if a in point_tuples and b in point_tuples:
+                    # store sorted tuples to avoid duplicates
+                    edges_set.add(tuple(sorted([a, b])))
+        # Convert to index-based edges
+        edges_idx = [(self.point_idx_map[a], self.point_idx_map[b]) for a, b in edges_set]
+        return edges_idx
     
     def _full_edges(self):
             """
@@ -224,8 +103,6 @@ class GeodesicShell:
         # Boundary vertices = those connected to only 1 edge
         boundary_nodes = [v for v, count in edge_count.items() if count == 1]
         return boundary_nodes
-
-
 
     # -----------------------------
     # Helper functions for geodesic manipulation
@@ -473,57 +350,6 @@ class GeodesicShell:
         self.edges.append((a_idx, b_idx))
         return len(self.edges) - 1  # Return index of new edge
 
-    def export_ml_dataset(self, output_path, include_dense_adjacency=False):
-        """
-        Export shell geometry and metadata for machine-learning workflows.
-
-        Supported outputs:
-        - .npz: multi-array dataset (recommended)
-        - .npy:  point matrix only (N, 3)
-
-        Returns the absolute path of the written file.
-        """
-        ext = os.path.splitext(output_path)[1].lower()
-        if ext not in {".npz", ".npy"}:
-            raise ValueError("output_path must end with .npz or .npy")
-
-        points = np.asarray(self.points, dtype=np.float32)
-        faces = np.asarray(self.faces, dtype=np.int32)
-        edges = np.asarray(self.edges, dtype=np.int32)
-        boundary_nodes = np.asarray(self.boundary_nodes, dtype=np.int32)
-
-        # Sparse graph representation is generally better for ML than dense NxN.
-        edge_index = edges.T if edges.size else np.empty((2, 0), dtype=np.int32)
-
-        if ext == ".npy":
-            np.save(output_path, points)
-            return os.path.abspath(output_path)
-
-        save_payload = {
-            "points": points,
-            "faces": faces,
-            "edges": edges,
-            "edge_index": edge_index,
-            "boundary_nodes": boundary_nodes,
-            "num_layers": np.int32(self.num_layers),
-            "points_per_layer": np.int32(self.points_per_layer),
-            "edge_subdivisions": np.int32(self.edge_subdivisions),
-            "triangle_span": np.int32(self.triangle_span),
-            "tolerance": np.float32(self.tolerance),
-            "connectivity_stagger_fraction": np.float32(self.connectivity_stagger_fraction),
-        }
-
-        if include_dense_adjacency:
-            n = points.shape[0]
-            adjacency = np.zeros((n, n), dtype=np.uint8)
-            if edges.size:
-                adjacency[edges[:, 0], edges[:, 1]] = 1
-                adjacency[edges[:, 1], edges[:, 0]] = 1
-            save_payload["adjacency"] = adjacency
-
-        np.savez_compressed(output_path, **save_payload)
-        return os.path.abspath(output_path)
-
 def plot_geodesic_shell(shell, show_points=True, show_edges=True, show_boundary=True):
     """
     shell: GeodesicShell instance
@@ -567,32 +393,16 @@ def plot_geodesic_shell(shell, show_points=True, show_edges=True, show_boundary=
     plt.show()
 
 if __name__ == "__main__":
-    # Create geodesic shell with outer trapezoidal prism using triangular faces
-    # num_layers: number of horizontal layers (Z direction)
-    # points_per_layer: number of points around each layer's perimeter
-    # edge_subdivisions: number of segments per edge for surface conformance
-    # triangle_span controls base width around each ring (2 means apex at the middle index).
-    # Keep rings aligned; stagger is handled in face connectivity per layer band.
-    shell = GeodesicShell("Tibia_Section.stl", 
-                          num_layers=4,
-                          points_per_layer=24,
-                          edge_subdivisions=16,
-                          triangle_span=2,
-                          layer_stagger_fraction=0.0,
-                          connectivity_stagger_fraction=0.5)
+    shell = GeodesicShell("Tibia_Section.stl")
 
     # edge1 = shell.add_edge(0, 1)  # Example of adding an edge between two vertices
     # shell.subdivide_edge(edge1)
     # shell.project_points_to_surface()
 
     print(len(shell.points), "points")
-    print(len(shell.faces), "triangular faces")
     print(len(shell.edges), "edges")
     print(len(shell.boundary_nodes), "boundary nodes")
 
     print(len(shell.full_edges), "full edges")
-
-    ml_file = shell.export_ml_dataset("shell_ml_data.npz")
-    print("Saved ML dataset:", ml_file)
 
     plot_geodesic_shell(shell)

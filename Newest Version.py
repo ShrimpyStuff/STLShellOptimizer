@@ -1,6 +1,8 @@
 import numpy as np
 import trimesh
 import os
+import gmsh
+import meshio
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -65,7 +67,7 @@ class GeodesicShell:
         # Identify boundary nodes (edges that appear only once)
         self.boundary_nodes = self._find_boundary_nodes()
 
-        self.convert_edges_to_cylinders = self._convert_edges_to_cylinders()
+        self._generate_cylinder_mesh(radius=0.001, offset=0.0015, output_mesh="lattice.xdmf")
 
     def _generate_prism_boundary(self, num_layers=8, points_per_layer=12):
         """
@@ -316,29 +318,56 @@ class GeodesicShell:
         boundary_nodes = [v for v, count in edge_count.items() if count == 1]
         return boundary_nodes
 
-    def _convert_edges_to_cylinders(self):
-        struts = []
-
-        edges = self.edges
+    def _generate_cylinder_mesh(self, radius=0.001, offset=0.0015, mesh_size=0.5, output_mesh="lattice.xdmf"):
+        """
+        Export all edges as Gmsh .geo cylinders for tetrahedral meshing.
+        """
         vertices = self.points
-
+        edges = self.edges
         offset = 0.0015
         closest_points, distance, face_id = self.mesh.nearest.on_surface(vertices)
         normals = self.mesh.face_normals[face_id]
         offset_vertices = vertices + normals * offset
 
-        for e in edges:
-
-            p1 = offset_vertices[e[0]]
-            p2 = offset_vertices[e[1]]
-
-            cyl = self.edge_to_cylinder(p1, p2, radius=0.001)
-
-            if cyl is not None:
-                struts.append(cyl)
+        gmsh.initialize()
+        gmsh.model.add("cylinder_lattice")
+        gmsh.option.setNumber("General.Terminal", 1)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.2)
         
-        lattice_mesh = trimesh.util.concatenate(struts)
-        lattice_mesh.export("edge_struts.stl")
+        # Add cylinders for each edge
+        for i, (a_idx, b_idx) in enumerate(edges):
+            x0, y0, z0 = offset_vertices[a_idx]
+            x1, y1, z1 = offset_vertices[b_idx]
+            dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+            gmsh.model.occ.addCylinder(x0, y0, z0, dx, dy, dz, radius, tag=i+1)
+
+        gmsh.model.occ.synchronize()
+
+        # 3D meshing
+        gmsh.model.mesh.generate(3)
+
+        # Export temporary msh
+        temp_msh = "temp_cylinders.msh"
+        gmsh.write(temp_msh)
+        gmsh.finalize()
+
+        # Convert to XDMF for Dolfinx
+        msh = meshio.read(temp_msh)
+
+        # Extract tetrahedra
+        tet_cells = [cell for cell in msh.cells if cell.type == "tetra"]
+        if len(tet_cells) == 0:
+            raise RuntimeError("No tetrahedral elements found; adjust mesh size or offset.")
+
+        # Create new meshio mesh with only tets
+        tet_mesh = meshio.Mesh(points=msh.points,
+                            cells={"tetra": tet_cells[0].data})
+        
+        # Save as XDMF
+        meshio.write(output_mesh, tet_mesh)
+        os.remove(temp_msh)
+        return output_mesh
 
     # -----------------------------
     # Helper functions for geodesic manipulation
@@ -566,46 +595,7 @@ class GeodesicShell:
         corner_a = walk_to_corner(a_idx, b_idx)
         corner_b = walk_to_corner(b_idx, a_idx)
         
-        return self.points[corner_a], self.points[corner_b]
-
-    def edge_to_cylinder(self, p1, p2, radius=0.05, sections=12):
-
-        p1 = np.array(p1)
-        p2 = np.array(p2)
-
-        direction = p2 - p1
-        length = np.linalg.norm(direction)
-        direction /= length
-        
-        extension = radius * 1.2
-        p1 = p1 - direction * extension
-        p2 = p2 + direction * extension
-
-        vec = p2 - p1
-        length = np.linalg.norm(vec)
-
-        if length == 0:
-            return None
-
-        direction = vec / length
-
-        # cylinder initially along Z
-        cyl = trimesh.creation.cylinder(
-            radius=radius,
-            height=length,
-            sections=sections
-        )
-
-        # rotate to edge direction
-        T = trimesh.geometry.align_vectors([0,0,1], direction)
-        cyl.apply_transform(T)
-
-        # move to midpoint
-        midpoint = (p1 + p2) / 2
-        cyl.apply_translation(midpoint)
-
-        return cyl
-    
+        return self.points[corner_a], self.points[corner_b]    
 
     def add_edge(self, a_idx, b_idx):
         """
@@ -715,7 +705,7 @@ if __name__ == "__main__":
     # triangle_span controls base width around each ring (2 means apex at the middle index).
     # Keep rings aligned; stagger is handled in face connectivity per layer band.
     shell = GeodesicShell("Tibia_No_Fill.stl", 
-                          num_layers=8,
+                          num_layers=16,
                           points_per_layer=24,
                           edge_subdivisions=8,
                           triangle_span=2,
@@ -738,4 +728,4 @@ if __name__ == "__main__":
     ml_file = shell.export_ml_dataset("shell_ml_data.npz")
     print("Saved ML dataset:", ml_file)
 
-    plot_geodesic_shell(shell)
+    # plot_geodesic_shell(shell)

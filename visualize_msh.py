@@ -162,7 +162,7 @@ def visualize_msh(path, alpha=0.55, show_all_nodes=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize a .msh file")
-    parser.add_argument("msh_path", nargs="?", default="shell_tetrahedral.msh", help="Path to .msh file")
+    parser.add_argument("msh_path", nargs="?", default="lattice.msh", help="Path to .msh file")
     parser.add_argument("--alpha", type=float, default=0.55, help="Surface transparency (0..1)")
     parser.add_argument("--show-all-nodes", action="store_true", help="Overlay all mesh nodes")
     args = parser.parse_args()

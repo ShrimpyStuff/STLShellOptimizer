@@ -11,13 +11,16 @@ class GeodesicShell:
     def __init__(
         self,
         stl_path,
-        tolerance=2e-3,
+        tolerance=1e-5,
         num_layers=8,
         points_per_layer=12,
         edge_subdivisions=5,
         triangle_span=2,
         layer_stagger_fraction=0.0,
         connectivity_stagger_fraction=0.5,
+        perimeter_stop_axis=None,
+        perimeter_stop_value=None,
+        perimeter_stop_side="ge",
     ):
         # Load STL
         mesh = trimesh.load_mesh(stl_path)
@@ -31,6 +34,10 @@ class GeodesicShell:
         self.triangle_span = triangle_span
         self.layer_stagger_fraction = layer_stagger_fraction
         self.connectivity_stagger_fraction = connectivity_stagger_fraction
+        self.perimeter_stop_axis = perimeter_stop_axis
+        self.perimeter_stop_value = perimeter_stop_value
+        self.perimeter_stop_side = perimeter_stop_side
+        self.closed_loop = True
 
         # Center mesh at origin
         center = mesh.bounds.mean(axis=0)
@@ -57,7 +64,8 @@ class GeodesicShell:
         
         # Identify boundary nodes (edges that appear only once)
         self.boundary_nodes = self._find_boundary_nodes()
-        self.full_edges = self._full_edges()
+
+        self.convert_edges_to_cylinders = self._convert_edges_to_cylinders()
 
     def _generate_prism_boundary(self, num_layers=8, points_per_layer=12):
         """
@@ -87,19 +95,103 @@ class GeodesicShell:
         y_radius = (y_max - y_min) / 2
         
         points = []
+
+        # Build angle samples once so each layer has the same perimeter indexing.
+        angles = self._select_perimeter_angles(
+            x_center=x_center,
+            y_center=y_center,
+            x_radius=x_radius,
+            y_radius=y_radius,
+            points_per_layer=points_per_layer,
+        )
         
         # Generate points layer by layer (Z direction)
         for iz in range(num_layers):
             z = z_min + (z_max - z_min) * iz / (num_layers - 1) if num_layers > 1 else (z_min + z_max) / 2
             
-            # Create a loop of points around the perimeter at this Z level
-            for ip in range(points_per_layer):
-                angle = 2 * np.pi * ip / points_per_layer
+            # Create perimeter points (full loop or clipped arc) at this Z level.
+            for angle in angles:
                 x = x_center + x_radius * np.cos(angle)
                 y = y_center + y_radius * np.sin(angle)
                 points.append([x, y, z])
         
         return np.array(points)
+
+    def _select_perimeter_angles(
+        self,
+        x_center,
+        y_center,
+        x_radius,
+        y_radius,
+        points_per_layer,
+    ):
+        """
+        Return perimeter angles for each ring.
+        - Full shell: returns evenly spaced 0..2pi angles and marks loop closed.
+        - Partial shell: clips perimeter by axis threshold and returns an open arc.
+        """
+        if self.perimeter_stop_axis is None or self.perimeter_stop_value is None:
+            self.closed_loop = True
+            return np.linspace(0.0, 2.0 * np.pi, points_per_layer, endpoint=False)
+
+        axis = str(self.perimeter_stop_axis).lower()
+        side = str(self.perimeter_stop_side).lower()
+        if axis not in {"x", "y"}:
+            raise ValueError("perimeter_stop_axis must be 'x' or 'y' for perimeter clipping")
+        if side not in {"le", "ge"}:
+            raise ValueError("perimeter_stop_side must be 'le' or 'ge'")
+
+        dense_n = max(720, points_per_layer * 20)
+        dense_angles = np.linspace(0.0, 2.0 * np.pi, dense_n, endpoint=False)
+        x_vals = x_center + x_radius * np.cos(dense_angles)
+        y_vals = y_center + y_radius * np.sin(dense_angles)
+        axis_values = x_vals if axis == "x" else y_vals
+
+        if side == "le":
+            mask = axis_values <= float(self.perimeter_stop_value)
+        else:
+            mask = axis_values >= float(self.perimeter_stop_value)
+
+        if np.all(mask):
+            self.closed_loop = True
+            return np.linspace(0.0, 2.0 * np.pi, points_per_layer, endpoint=False)
+        if not np.any(mask):
+            raise ValueError("perimeter clip removed all perimeter points; adjust stop value")
+
+        # Keep the longest contiguous valid arc on the circular mask.
+        mask2 = np.concatenate([mask, mask])
+        best_start = None
+        best_len = 0
+        run_start = None
+
+        for idx, keep in enumerate(mask2):
+            if keep and run_start is None:
+                run_start = idx
+            if not keep and run_start is not None:
+                run_len = idx - run_start
+                if run_start < dense_n and run_len > best_len:
+                    best_start = run_start
+                    best_len = run_len
+                run_start = None
+
+        if run_start is not None:
+            run_len = len(mask2) - run_start
+            if run_start < dense_n and run_len > best_len:
+                best_start = run_start
+                best_len = run_len
+
+        if best_start is None or best_len < 2:
+            raise ValueError("perimeter clip produced insufficient arc points")
+
+        self.closed_loop = False
+        best_end = best_start + best_len - 1
+        start_angle = dense_angles[best_start % dense_n]
+        end_angle = dense_angles[best_end % dense_n]
+        if end_angle <= start_angle:
+            end_angle += 2.0 * np.pi
+
+        # Open arc: include endpoints, no wrap-around.
+        return np.linspace(start_angle, end_angle, points_per_layer, endpoint=True)
 
     def _project_to_surface(self, num_segments=5):
         """
@@ -159,28 +251,45 @@ class GeodesicShell:
             span += 1
         half = span // 2
         
-        # Create triangular faces between adjacent layers
-        # Stagger connectivity by band while keeping ring geometry aligned.
+        # Create triangular faces between adjacent layers.
+        # Closed loops wrap around with modulo; open loops stop at the arc ends.
         for layer in range(num_layers - 1):
             lower_base = layer * ppl
             upper_base = (layer + 1) * ppl
-            band_shift = int(round(layer * self.connectivity_stagger_fraction * span)) % ppl
-            
-            for i in range(ppl):
-                j = (i + band_shift) % ppl
+
+            if self.closed_loop:
+                band_shift = int(round(layer * self.connectivity_stagger_fraction * span)) % ppl
+                i_range = range(ppl)
+            else:
+                band_shift = 0
+                i_range = range(max(0, ppl - span))
+
+            for i in i_range:
+                if self.closed_loop:
+                    j = (i + band_shift) % ppl
+                    lower_a = lower_base + j
+                    lower_b = lower_base + ((j + span) % ppl)
+                    upper_mid = upper_base + ((j + half) % ppl)
+                    upper_a = upper_base + j
+                    upper_b = upper_base + ((j + span) % ppl)
+                    lower_mid = lower_base + ((j + half) % ppl)
+                else:
+                    j = i + band_shift
+                    if (j + span) >= ppl:
+                        continue
+                    lower_a = lower_base + j
+                    lower_b = lower_base + (j + span)
+                    upper_mid = upper_base + (j + half)
+                    upper_a = upper_base + j
+                    upper_b = upper_base + (j + span)
+                    lower_mid = lower_base + (j + half)
 
                 # Alternate orientation by index to avoid overlapping triangles.
                 if i % 2 == 0:
                     # Base on lower layer, apex at midpoint on upper layer.
-                    lower_a = lower_base + j
-                    lower_b = lower_base + ((j + span) % ppl)
-                    upper_mid = upper_base + ((j + half) % ppl)
                     faces.append((lower_a, lower_b, upper_mid))
                 else:
                     # Base on upper layer, apex at midpoint on lower layer.
-                    upper_a = upper_base + j
-                    upper_b = upper_base + ((j + span) % ppl)
-                    lower_mid = lower_base + ((j + half) % ppl)
                     faces.append((upper_a, lower_mid, upper_b))
         
         return faces
@@ -196,24 +305,6 @@ class GeodesicShell:
             edges_set.add(tuple(sorted([face[2], face[0]])))
         
         return list(edges_set)
-    
-    def _full_edges(self):
-            """
-            Build a set of all macro edges (struts between major corners) of the curved shape.
-            Returns a set of sorted coordinate tuples to avoid (A, B) and (B, A) duplicates.
-            """
-            full_edges = set()
-            for edge_idx in range(len(self.edges)):
-                corner_a, corner_b = self.find_closest_corners(edge_idx)
-                
-                # Sort the coordinate tuples lexicographically so (A, B) == (B, A)
-                edge_pair = tuple(sorted((tuple(corner_a), tuple(corner_b))))
-                
-                # Prevent adding zero-length edges just in case
-                if edge_pair[0] != edge_pair[1]:
-                    full_edges.add(edge_pair)
-                    
-            return full_edges
 
     def _find_boundary_nodes(self):
         # Count edges per vertex to find boundary vertices
@@ -225,7 +316,29 @@ class GeodesicShell:
         boundary_nodes = [v for v, count in edge_count.items() if count == 1]
         return boundary_nodes
 
+    def _convert_edges_to_cylinders(self):
+        struts = []
 
+        edges = self.edges
+        vertices = self.points
+
+        offset = 0.0015
+        closest_points, distance, face_id = self.mesh.nearest.on_surface(vertices)
+        normals = self.mesh.face_normals[face_id]
+        offset_vertices = vertices + normals * offset
+
+        for e in edges:
+
+            p1 = offset_vertices[e[0]]
+            p2 = offset_vertices[e[1]]
+
+            cyl = self.edge_to_cylinder(p1, p2, radius=0.001)
+
+            if cyl is not None:
+                struts.append(cyl)
+        
+        lattice_mesh = trimesh.util.concatenate(struts)
+        lattice_mesh.export("edge_struts.stl")
 
     # -----------------------------
     # Helper functions for geodesic manipulation
@@ -455,15 +568,43 @@ class GeodesicShell:
         
         return self.points[corner_a], self.points[corner_b]
 
-    def add_thickness(self, thickness=2.0):
-        """
-        Add uniform thickness along vertex normals.
-        Returns outer_points, inner_points
-        """
-        normals = self.vertex_normals[:len(self.points)]
-        outer = self.points + 0.5 * thickness * normals
-        inner = self.points - 0.5 * thickness * normals
-        return outer, inner
+    def edge_to_cylinder(self, p1, p2, radius=0.05, sections=12):
+
+        p1 = np.array(p1)
+        p2 = np.array(p2)
+
+        direction = p2 - p1
+        length = np.linalg.norm(direction)
+        direction /= length
+        
+        extension = radius * 1.2
+        p1 = p1 - direction * extension
+        p2 = p2 + direction * extension
+
+        vec = p2 - p1
+        length = np.linalg.norm(vec)
+
+        if length == 0:
+            return None
+
+        direction = vec / length
+
+        # cylinder initially along Z
+        cyl = trimesh.creation.cylinder(
+            radius=radius,
+            height=length,
+            sections=sections
+        )
+
+        # rotate to edge direction
+        T = trimesh.geometry.align_vectors([0,0,1], direction)
+        cyl.apply_transform(T)
+
+        # move to midpoint
+        midpoint = (p1 + p2) / 2
+        cyl.apply_translation(midpoint)
+
+        return cyl
     
 
     def add_edge(self, a_idx, b_idx):
@@ -573,13 +714,17 @@ if __name__ == "__main__":
     # edge_subdivisions: number of segments per edge for surface conformance
     # triangle_span controls base width around each ring (2 means apex at the middle index).
     # Keep rings aligned; stagger is handled in face connectivity per layer band.
-    shell = GeodesicShell("Tibia_Section.stl", 
-                          num_layers=4,
+    shell = GeodesicShell("Tibia_No_Fill.stl", 
+                          num_layers=8,
                           points_per_layer=24,
-                          edge_subdivisions=16,
+                          edge_subdivisions=8,
                           triangle_span=2,
                           layer_stagger_fraction=0.0,
-                          connectivity_stagger_fraction=0.5)
+                          connectivity_stagger_fraction=0.5,
+                          # Example partial shell: keep only x <= 0 side of perimeter arc.
+                          perimeter_stop_axis="x",
+                          perimeter_stop_value=-0.011, # add about 4e-4
+                          perimeter_stop_side="ge") # le or ge
 
     # edge1 = shell.add_edge(0, 1)  # Example of adding an edge between two vertices
     # shell.subdivide_edge(edge1)
@@ -589,8 +734,6 @@ if __name__ == "__main__":
     print(len(shell.faces), "triangular faces")
     print(len(shell.edges), "edges")
     print(len(shell.boundary_nodes), "boundary nodes")
-
-    print(len(shell.full_edges), "full edges")
 
     ml_file = shell.export_ml_dataset("shell_ml_data.npz")
     print("Saved ML dataset:", ml_file)

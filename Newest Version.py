@@ -58,16 +58,17 @@ class GeodesicShell:
         # Build triangular faces for prism shell
         self.faces = self._build_prism_faces()
         
-        # Extract edges from faces
+        # Extract edges from faces (can be regenerated after subdivision)
         self.edges = self._extract_edges_from_faces()
         
         # Project the entire prism onto the mesh surface with edge subdivision
-        self._project_to_surface(num_segments=edge_subdivisions)
+        # self._project_to_surface(num_segments=edge_subdivisions)
         
         # Identify boundary nodes (edges that appear only once)
         self.boundary_nodes = self._find_boundary_nodes()
 
-        self._generate_cylinder_mesh(radius=0.001, offset=0.0015, output_mesh="lattice.xdmf")
+        # Note: cylinder mesh generation is now called manually from main if needed
+        # self._generate_cylinder_mesh(radius=0.001, offset=0.0015, output_mesh="lattice.xdmf")
 
     def _generate_prism_boundary(self, num_layers=8, points_per_layer=12):
         """
@@ -296,6 +297,69 @@ class GeodesicShell:
         
         return faces
     
+    def subdivide_faces_v2(self):
+        """
+        Perform v2 geodesic subdivision: split each triangular face into 4 smaller triangles.
+        Creates midpoint vertices on each edge and reconnects to form 4 triangles per original face.
+        Can be called multiple times to increase subdivision level.
+        
+        NOTE: This operates on the current geometry (bounding box or projected).
+        Call project_all_to_surface() afterward to project the subdivided mesh to the STL surface.
+        
+        Returns
+        -------
+        self : GeodesicShell
+            Returns self for method chaining.
+        """
+        if not self.faces:
+            return
+        
+        # Dictionary to store midpoints: edge (sorted tuple) -> new vertex index
+        edge_midpoints = {}
+        
+        def get_or_create_midpoint(v1_idx, v2_idx):
+            """Get existing midpoint or create a new one."""
+            edge = tuple(sorted([v1_idx, v2_idx]))
+            if edge in edge_midpoints:
+                return edge_midpoints[edge]
+            
+            # Create new midpoint
+            v1 = self.points[v1_idx]
+            v2 = self.points[v2_idx]
+            midpoint = (v1 + v2) / 2.0
+            
+            new_idx = len(self.points)
+            self.points = np.vstack([self.points, midpoint])
+            edge_midpoints[edge] = new_idx
+            return new_idx
+        
+        # Subdivide each face into 4 faces
+        new_faces = []
+        for face in self.faces:
+            v0, v1, v2 = face
+            
+            # Get or create midpoints on each edge
+            m01 = get_or_create_midpoint(v0, v1)
+            m12 = get_or_create_midpoint(v1, v2)
+            m20 = get_or_create_midpoint(v2, v0)
+            
+            # Create 4 new triangles:
+            # Corner triangles
+            new_faces.append((v0, m01, m20))
+            new_faces.append((v1, m12, m01))
+            new_faces.append((v2, m20, m12))
+            # Center triangle
+            new_faces.append((m01, m12, m20))
+        
+        self.faces = new_faces
+        
+        # Regenerate edges from updated faces
+        self.edges = self._extract_edges_from_faces()
+        
+        # Update boundary nodes
+        self.boundary_nodes = self._find_boundary_nodes()
+        return self
+    
     def _extract_edges_from_faces(self):
         """
         Extract unique edges directly from triangular faces.
@@ -318,10 +382,11 @@ class GeodesicShell:
         boundary_nodes = [v for v, count in edge_count.items() if count == 1]
         return boundary_nodes
 
-    def _generate_cylinder_mesh(self, radius=0.001, offset=0.0015, mesh_size=0.5, output_mesh="lattice.xdmf"):
+    def _generate_cylinder_mesh(self, radius=0.001, offset=0.0015, mesh_size=0.0005, output_mesh="lattice.xdmf"):
         """
         Export all edges as Gmsh .geo cylinders for tetrahedral meshing.
         """
+        print("Generating Cylinders")
         vertices = self.points
         edges = self.edges
         offset = 0.0015
@@ -332,28 +397,44 @@ class GeodesicShell:
         gmsh.initialize()
         gmsh.model.add("cylinder_lattice")
         gmsh.option.setNumber("General.Terminal", 1)
+        gmsh.option.setNumber("General.NumThreads", 0)  # 0 = use all available cores
+        gmsh.option.setNumber("Mesh.Algorithm3D", 10)
         # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.2)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.3)
         
         # Add cylinders for each edge
+        cylinder_tag = 1
         for i, (a_idx, b_idx) in enumerate(edges):
             x0, y0, z0 = offset_vertices[a_idx]
             x1, y1, z1 = offset_vertices[b_idx]
             dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-            gmsh.model.occ.addCylinder(x0, y0, z0, dx, dy, dz, radius, tag=i+1)
+            
+            # Skip degenerate edges (zero length)
+            length = np.sqrt(dx**2 + dy**2 + dz**2)
+            if length < 1e-10:
+                print(f"Warning: Skipping edge {i} (vertices {a_idx}->{b_idx}) with zero length")
+                continue
+            
+            gmsh.model.occ.addCylinder(x0, y0, z0, dx, dy, dz, radius, tag=cylinder_tag)
+            cylinder_tag += 1
 
         gmsh.model.occ.synchronize()
+        volumes = gmsh.model.occ.getEntities(3)
+        gmsh.model.occ.fragment(volumes, [])
+        gmsh.model.occ.synchronize()
 
-        # 3D meshing
+
         gmsh.model.mesh.generate(3)
-
-        # Export temporary msh
-        temp_msh = "temp_cylinders.msh"
-        gmsh.write(temp_msh)
+        
+        # Save .msh file with versioned name (not temp, keep it)
+        base_name = os.path.splitext(output_mesh)[0]
+        msh_file = f"{base_name}_v2.msh"
+        gmsh.write(msh_file)
+        print(f"Saved intermediate mesh: {msh_file}")
         gmsh.finalize()
 
         # Convert to XDMF for Dolfinx
-        msh = meshio.read(temp_msh)
+        msh = meshio.read(msh_file)
 
         # Extract tetrahedra
         tet_cells = [cell for cell in msh.cells if cell.type == "tetra"]
@@ -361,12 +442,12 @@ class GeodesicShell:
             raise RuntimeError("No tetrahedral elements found; adjust mesh size or offset.")
 
         # Create new meshio mesh with only tets
-        tet_mesh = meshio.Mesh(points=msh.points,
-                            cells={"tetra": tet_cells[0].data})
+        tetra = np.vstack([c.data for c in tet_cells])
+        tet_mesh = meshio.Mesh(points=msh.points, cells={"tetra": tetra})
         
         # Save as XDMF
         meshio.write(output_mesh, tet_mesh)
-        os.remove(temp_msh)
+        print(f"Saved XDMF mesh: {output_mesh}")
         return output_mesh
 
     # -----------------------------
@@ -427,15 +508,13 @@ class GeodesicShell:
         self.edges.append((new_idx, b_idx))
         return new_idx, (a_idx, new_idx), (new_idx, b_idx)
 
-    def subdivide_edge_to_vertex(self, edge_idx, target_idx, num_subdiv=3, full_edge=False):
+    def subdivide_edge_to_vertex(self, edge_idx, target_idx, num_subdiv=3):
         """
         Create a curve from edge midpoint to another vertex (like a geodesic strut)
         """
         a_idx, b_idx = self.edges[edge_idx]
         a = self.points[a_idx]
         b = self.points[b_idx]
-        if full_edge:
-            a, b = self.find_closest_corners(edge_idx)
         target = self.points[target_idx]
 
         # Start with midpoint of edge
@@ -484,7 +563,7 @@ class GeodesicShell:
 
         return [idx for idx, _ in new_edge_list]
     
-    def split_edge_multiple_to_vertex(self, edge_idx, target_idx, num_splits=3, num_subdiv=3, full_edge=False):
+    def split_edge_multiple_to_vertex(self, edge_idx, target_idx, num_splits=3):
         """
         Split an edge into multiple segments and create struts to the target vertex,
         each strut subdivided into num_subdiv intermediate points
@@ -492,8 +571,6 @@ class GeodesicShell:
         a_idx, b_idx = self.edges[edge_idx]
         a = self.points[a_idx]
         b = self.points[b_idx]
-        if full_edge:
-            a, b = self.find_closest_corners(edge_idx)
         target = self.points[target_idx]
 
         # Create split points along the edge (evenly spaced)
@@ -522,16 +599,6 @@ class GeodesicShell:
         for split_idx in split_indices:
             split_pt = self.points[split_idx]
             prev_idx = split_idx
-
-            # Create num_subdiv intermediate points along the strut
-            for i in range(1, num_subdiv + 1):
-                t = i / (num_subdiv + 1)
-                strut_point = split_pt * (1 - t) + target * t
-                new_idx = len(self.points)
-                self.points = np.vstack([self.points, strut_point])
-                new_edge_list.append((prev_idx, new_idx))
-                prev_idx = new_idx
-
             # Connect last intermediate point to target
             new_edge_list.append((prev_idx, target_idx))
 
@@ -541,8 +608,6 @@ class GeodesicShell:
         # Add new edges
         self.edges.extend(new_edge_list)
 
-        self.project_points_to_surface()  # Ensure new points lie on surface
-
         return [idx for idx, _ in new_edge_list]
 
     def project_points_to_surface(self):
@@ -551,51 +616,6 @@ class GeodesicShell:
         """
         closest_points, _, _ = trimesh.proximity.closest_point(self.mesh, self.points)
         self.points = closest_points
-
-    def find_closest_corners(self, edge_idx):
-        """
-        Walk along a subdivided line to find the major junctions/corners at the ends.
-        A corner is defined as any vertex with a valence NOT equal to 2 (e.g., junctions 
-        with 3+ connections, or dead-end boundaries with 1 connection).
-        """
-        a_idx, b_idx = self.edges[edge_idx]
-
-        def walk_to_corner(start_idx, coming_from_idx):
-            current_idx = start_idx
-            prev_idx = coming_from_idx
-            
-            # Safety counter to prevent infinite loops in closed circular loops
-            max_steps = len(self.points) 
-            steps = 0
-            
-            while steps < max_steps:
-                steps += 1
-                
-                # Find all neighbors of the current vertex
-                neighbors = []
-                for e in self.edges:
-                    if current_idx == e[0]:
-                        neighbors.append(e[1])
-                    elif current_idx == e[1]:
-                        neighbors.append(e[0])
-                
-                # If valence != 2, we have found a structural corner or boundary
-                if len(neighbors) != 2:
-                    return current_idx
-                    
-                # Otherwise, it's a subdivision point (valence == 2). 
-                # Keep walking to the neighbor that isn't the one we just came from.
-                next_idx = neighbors[0] if neighbors[1] == prev_idx else neighbors[1]
-                
-                prev_idx = current_idx
-                current_idx = next_idx
-                
-            return current_idx # Fallback if loop finishes (e.g., a perfect circle)
-
-        corner_a = walk_to_corner(a_idx, b_idx)
-        corner_b = walk_to_corner(b_idx, a_idx)
-        
-        return self.points[corner_a], self.points[corner_b]    
 
     def add_edge(self, a_idx, b_idx):
         """
@@ -707,7 +727,7 @@ if __name__ == "__main__":
     shell = GeodesicShell("Tibia_No_Fill.stl", 
                           num_layers=16,
                           points_per_layer=24,
-                          edge_subdivisions=8,
+                          edge_subdivisions=4,
                           triangle_span=2,
                           layer_stagger_fraction=0.0,
                           connectivity_stagger_fraction=0.5,
@@ -716,16 +736,29 @@ if __name__ == "__main__":
                           perimeter_stop_value=-0.011, # add about 4e-4
                           perimeter_stop_side="ge") # le or ge
 
-    # edge1 = shell.add_edge(0, 1)  # Example of adding an edge between two vertices
-    # shell.subdivide_edge(edge1)
-    # shell.project_points_to_surface()
+    # Apply v2 geodesic subdivision in a loop on the CLEAN bounding-box geometry
+    # subdivision_levels: 0 = no subdivision, 1 = 4x faces, 2 = 16x faces, etc.
+    # This gives clean triangles before projecting to the curved surface
+    subdivision_levels = 1
+    for i in range(subdivision_levels):
+        print(f"\nApplying subdivision level {i+1}/{subdivision_levels} on clean geometry...")
+        shell.subdivide_faces_v2()
+    
+    # NOW project all vertices (original + subdivided midpoints) to the STL surface
+    shell._project_to_surface(shell.edge_subdivisions)
+    
+    print(f"\nFinal lattice structure:")
+    print(f"  {len(shell.points)} vertices")
+    print(f"  {len(shell.faces)} triangular faces")
+    print(f"  {len(shell.edges)} edges")
+    print(f"  {len(shell.boundary_nodes)} boundary nodes")
 
-    print(len(shell.points), "points")
-    print(len(shell.faces), "triangular faces")
-    print(len(shell.edges), "edges")
-    print(len(shell.boundary_nodes), "boundary nodes")
+    # # Generate cylinder mesh for FEM
+    print("\nGenerating cylinder mesh...")
+    shell._generate_cylinder_mesh(radius=0.001, offset=0.0015, output_mesh="lattice.xdmf")
+    
+    # Export for ML if needed
+    # ml_file = shell.export_ml_dataset("shell_ml_data.npz")
+    # print("Saved ML dataset:", ml_file)
 
-    ml_file = shell.export_ml_dataset("shell_ml_data.npz")
-    print("Saved ML dataset:", ml_file)
-
-    # plot_geodesic_shell(shell)
+    plot_geodesic_shell(shell)

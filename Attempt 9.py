@@ -332,6 +332,8 @@ class GeodesicShell:
         gmsh.initialize()
         gmsh.model.add("cylinder_lattice")
         gmsh.option.setNumber("General.Terminal", 1)
+        gmsh.option.setNumber("General.NumThreads", 0)  # 0 = use all available cores
+        gmsh.option.setNumber("Mesh.MaxNumThreads", 0)  # 0 = use all available cores for meshing
         # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
         # gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.2)
         

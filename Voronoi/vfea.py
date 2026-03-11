@@ -333,39 +333,77 @@ def get_member_stresses_and_displacements(model, vertex_node_names, load_case='C
     return member_stress_data
 
 
-def calculate_section_area_from_stress(base_area, stress_level, scale_factor=2.0):
+# Bone remodeling target SED (Wolff's law reference)
+# Cortical bone: E = 2.9e6 psi, physiological strain ~ 2000 microstrain
+# SED_target = 0.5 * E * epsilon_ref^2 = 0.5 * 2.9e6 * (2e-3)^2 ~ 5.8 psi
+BONE_SED_TARGET = 0.5 * 2.9e6 * (2000e-6) ** 2  # ~5.8 psi
+
+
+def compute_member_sed_from_displacements(member, load_case='Combo 1'):
     """
-    Calculate new section area based on stress level.
-    Higher stress -> larger area
-    Lower stress -> smaller area
-    Bounded to avoid extremely thin or thick sections.
+    Compute the axial strain energy density of a member from nodal displacements:
+        epsilon_axial = dot(dj - di, e_hat) / L       (axial strain)
+        SED = 0.5 * E * epsilon_axial^2               (strain energy density)
+
+    Using axial strain only (not bending) is critical:
+    - It is INDEPENDENT of section area A, so there is no positive-feedback
+      loop (a thicker member does NOT automatically get higher SED).
+    - It directly measures how much axial load each member carries: members
+      on load paths stretch more, get higher SED, and gain material.
+    - Bending SED from end-displacement would scale as side^2 (Iz/A ∝ side^2),
+      causing runaway thickening of whichever member gets thickest first.
     """
-    # Stress level is normalized (0 to 1)
-    # Scale from 0.3x to 3.0x the base area
-    min_scale = 0.3
-    max_scale = 3.0
-    area_scale = min_scale + (stress_level * (max_scale - min_scale))
-    new_area = base_area * area_scale
-    return new_area
+    i_node = member.i_node
+    j_node = member.j_node
+
+    def _disp(node, dof):
+        val = getattr(node, dof, 0.0)
+        if isinstance(val, dict):
+            val = val.get(load_case, 0.0)
+        return 0.0 if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
+
+    di = np.array([_disp(i_node, 'DX'), _disp(i_node, 'DY'), _disp(i_node, 'DZ')])
+    dj = np.array([_disp(j_node, 'DX'), _disp(j_node, 'DY'), _disp(j_node, 'DZ')])
+
+    xi, yi, zi = i_node.X, i_node.Y, i_node.Z
+    xj, yj, zj = j_node.X, j_node.Y, j_node.Z
+    L = float(np.sqrt((xj - xi) ** 2 + (yj - yi) ** 2 + (zj - zi) ** 2))
+    if L < 1e-10:
+        return 0.0
+
+    e = np.array([xj - xi, yj - yi, zj - zi]) / L  # unit axial vector
+    delta_axial = float(np.dot(dj - di, e))
+    epsilon_axial = delta_axial / L
+
+    E = member.material.E
+    return 0.5 * E * epsilon_axial ** 2
 
 
 def optimize_member_thicknesses(result, num_iterations=5, base_side_length=0.2, damping_factor=0.5):
     """
-    Iteratively optimize member thicknesses based on deflection/stress.
-    Saves iteration data to CSV and images for first and last iterations.
-    
-    Parameters:
-    -----------
+    Iteratively redistribute member thicknesses to equalise strain energy
+    density (SED) across all beams, mimicking bone remodelling (Wolff's law).
+
+    Update rule — Optimality Criteria (OC) power law with volume conservation:
+        A_new_i = A_old_i * (SED_i / SED_mean)^beta
+
+    All provisional areas are then scaled so total structural volume is
+    preserved (material is redistributed, not created). This prevents the
+    runaway where one member grows indefinitely at the expense of others.
+
+    Convergence is measured by the coefficient of variation of SED values
+    across members: CV → 0 means all members carry equal SED.
+
+    Parameters
+    ----------
     result : dict
-        FEA model result dictionary
+        FEA model result dictionary.
     num_iterations : int
-        Number of optimization iterations
+        Number of optimization iterations.
     base_side_length : float
-        Initial member cross-section side length (for square)
+        Initial square cross-section side length (inches).
     damping_factor : float
-        Damping factor (0-1) to smooth convergence and prevent oscillation.
-        Lower values = smoother convergence, slower improvement.
-        Higher values = faster changes, higher risk of oscillation.
+        Power-law exponent beta (0.2-0.5). Lower = smoother; higher = faster.
     """
     import csv
     from datetime import datetime
@@ -407,46 +445,55 @@ def optimize_member_thicknesses(result, num_iterations=5, base_side_length=0.2, 
         }
     
     print(f"\n{'='*70}")
-    print(f"STARTING THICKNESS OPTIMIZATION LOOP")
+    print(f"BONE SED REMODELING OPTIMIZATION")
     print(f"{'='*70}")
-    print(f"Iterations: {num_iterations}")
-    print(f"Base section: {base_side_length}\" × {base_side_length}\" square")
-    print(f"Damping factor: {damping_factor}\n")
+    print(f"Iterations:     {num_iterations}")
+    print(f"Base section:   {base_side_length}\" × {base_side_length}\" square")
+    print(f"Damping factor: {damping_factor}")
+    print(f"SED target:     {BONE_SED_TARGET:.4e} psi  (cortical bone @ 2000 microstrain)\n")
     
     for iteration in range(num_iterations):
         print(f"\n--- ITERATION {iteration + 1}/{num_iterations} ---")
-        
+
         # Analyze current model
         model.analyze(check_stability=False)
-        
-        # Extract displacements
+
+        # Extract displacements (kept for visualisation)
         min_node, max_node, displacements = extract_displacement_extrema(model, vertex_node_names)
-        
-        # Get member stresses
-        member_stresses = get_member_stresses_and_displacements(model, vertex_node_names)
-        
-        # Calculate max stress for normalization
-        max_stress = max([data['stress'] for data in member_stresses.values()]) if member_stresses else 1.0
-        if max_stress == 0.0:
-            max_stress = 1.0
-        
-        # Calculate metrics for this iteration
+
+        # ---- Compute SED per member from nodal displacements ----------------
+        member_sed = {}
+        for member_name in member_names:
+            member = model.members[member_name]
+            member_sed[member_name] = compute_member_sed_from_displacements(member, load_case='Combo 1')
+
+        # ---- Metrics ---------------------------------------------------------
+        all_seds = list(member_sed.values())
+        all_seds_arr = np.array(all_seds, dtype=float)
+        mean_sed = float(np.mean(all_seds_arr)) if len(all_seds_arr) else 0.0
+        max_sed = float(np.max(all_seds_arr)) if len(all_seds_arr) else 0.0
+        # Coefficient of Variation: close to 0 → members have equal SED (converged)
+        cv = float(np.std(all_seds_arr) / mean_sed) if mean_sed > 0 else float('inf')
+
         max_displacement = max([d.get('total', 0.0) for d in displacements.values()]) if displacements else 0.0
-        total_weight = sum([member_sections[m]['A'] * 50.0 for m in member_names])  # Rough estimate
-        avg_stress = np.mean([data['stress'] for data in member_stresses.values()]) if member_stresses else 0.0
-        
+        total_volume = sum(member_sections[m]['A'] * 50.0 for m in member_names)
+
         iteration_data = {
             'Iteration': iteration + 1,
+            'Mean_SED_psi': mean_sed,
+            'Max_SED_psi': max_sed,
+            'Bone_SED_Target_psi': BONE_SED_TARGET,
+            'SED_CoeffVariation': cv,
             'Max_Displacement_in': max_displacement,
-            'Avg_Stress': avg_stress,
-            'Total_Weight_estimate': total_weight,
-            'Max_Stress': max_stress
+            'Total_Volume_estimate': total_volume,
         }
-        
-        print(f"  Max Displacement: {max_displacement:.6e} in")
-        print(f"  Max Stress Level: {max_stress:.6e}")
-        print(f"  Avg Stress Level: {avg_stress:.6e}")
-        print(f"  Total Weight (est): {total_weight:.4f}")
+
+        print(f"  Bone SED target:    {BONE_SED_TARGET:.4e} psi")
+        print(f"  Mean SED:           {mean_sed:.4e} psi")
+        print(f"  Max SED:            {max_sed:.4e} psi")
+        print(f"  SED coeff. of var.: {cv:.4f}  (→0 = uniform SED = converged)")
+        print(f"  Max Displacement:   {max_displacement:.4e} in")
+        print(f"  Total Vol (est):    {total_volume:.4f}")
         
         # Save visualization for first iteration
         if iteration == 0:
@@ -459,37 +506,57 @@ def optimize_member_thicknesses(result, num_iterations=5, base_side_length=0.2, 
         
         iteration_history.append(iteration_data)
         
-        # Update section areas based on stresses (except on last iteration)
+        # Update section thicknesses using Optimality Criteria (except on last iteration)
         if iteration < num_iterations - 1:
-            print(f"  Updating member sections (damping={damping_factor})...")
-            
+            print(f"  Redistributing material toward uniform SED (beta={damping_factor:.2f})...")
+
+            # ---- Optimality Criteria power-law update -------------------------
+            # new_A_i  = A_i * (SED_i / SED_mean)^beta
+            # This grows high-SED members and shrinks low-SED members.
+            # Volume conservation ensures material is redistributed, not created:
+            #   sum(new_A_i * L_i) == sum(A_i * L_i)
+            # Per-step change is capped to ±40% to prevent oscillation.
+
+            ref_sed = mean_sed if mean_sed > 1e-20 else BONE_SED_TARGET
+            beta = damping_factor  # exponent (0.2–0.5 works well)
+
+            # Compute provisional new areas
+            prov_areas = {}
+            member_lengths = {}
             for member_name in member_names:
-                stress_data = member_stresses.get(member_name, {'stress': 0.0})
-                stress_level = stress_data['stress'] / max_stress if max_stress > 0 else 0.0
-                
-                # Calculate target area based on stress
-                target_A = calculate_section_area_from_stress(base_A, stress_level)
-                target_side = np.sqrt(target_A)
-                
-                # Apply damping to smooth convergence
-                current_A = member_sections[member_name]['A']
-                current_side = member_sections[member_name]['side_length']
-                
-                # Blend between current and target using damping factor
-                new_A = current_A + damping_factor * (target_A - current_A)
-                new_side = current_side + damping_factor * (target_side - current_side)
-                
-                # Ensure positive dimensions
-                new_A = max(new_A, 0.01)
-                new_side = max(new_side, 0.1)
-                
+                sed = member_sed.get(member_name, ref_sed)
+                if sed < 1e-20:
+                    sed = 1e-20  # prevent (0)^beta = 0 collapsing members
+                ratio = (sed / ref_sed) ** beta
+                # Cap per-step change to ±15% to prevent oscillation
+                ratio = float(np.clip(ratio, 0.85, 1.15))
+                new_A = member_sections[member_name]['A'] * ratio
+                prov_areas[member_name] = new_A
+
+                m = model.members[member_name]
+                xi, yi, zi = m.i_node.X, m.i_node.Y, m.i_node.Z
+                xj, yj, zj = m.j_node.X, m.j_node.Y, m.j_node.Z
+                member_lengths[member_name] = float(np.sqrt((xj-xi)**2+(yj-yi)**2+(zj-zi)**2))
+
+            # Volume conservation: scale all provisional areas so total volume is unchanged
+            V_current = sum(member_sections[m]['A'] * member_lengths[m] for m in member_names)
+            V_prov = sum(prov_areas[m] * member_lengths[m] for m in member_names)
+            vol_scale = (V_current / V_prov) if V_prov > 1e-20 else 1.0
+
+            for member_name in member_names:
+                new_A = prov_areas[member_name] * vol_scale
+                new_side = float(np.sqrt(new_A))
+                # Absolute bounds: keep all members physically meaningful
+                new_side = float(np.clip(new_side, 0.08, 1.5))
+                new_A = new_side ** 2
+
                 # Update section properties for this member
                 section_name = member_sections[member_name]['section_name']
                 model.sections[section_name].A = new_A
                 model.sections[section_name].Iy = (new_side ** 4) / 12
                 model.sections[section_name].Iz = (new_side ** 4) / 12
                 model.sections[section_name].J = (new_side ** 4) / 108
-                
+
                 # Update tracking
                 member_sections[member_name]['A'] = new_A
                 member_sections[member_name]['Iy'] = (new_side ** 4) / 12
@@ -523,13 +590,15 @@ def optimize_member_thicknesses(result, num_iterations=5, base_side_length=0.2, 
         
         # Print summary
         print(f"\n{'='*70}")
-        print(f"OPTIMIZATION SUMMARY")
+        print(f"BONE SED OPTIMIZATION SUMMARY")
         print(f"{'='*70}")
-        print(f"Initial Max Displacement: {iteration_history[0]['Max_Displacement_in']:.6e} in")
-        print(f"Final Max Displacement:   {iteration_history[-1]['Max_Displacement_in']:.6e} in")
-        print(f"Change: {((iteration_history[-1]['Max_Displacement_in'] - iteration_history[0]['Max_Displacement_in']) / iteration_history[0]['Max_Displacement_in'] * 100):.2f}%" if iteration_history[0]['Max_Displacement_in'] > 0 else "N/A")
-        print(f"Initial Total Weight:     {iteration_history[0]['Total_Weight_estimate']:.4f}")
-        print(f"Final Total Weight:       {iteration_history[-1]['Total_Weight_estimate']:.4f}")
+        print(f"Initial Mean SED:           {iteration_history[0]['Mean_SED_psi']:.4e} psi")
+        print(f"Final Mean SED:             {iteration_history[-1]['Mean_SED_psi']:.4e} psi")
+        print(f"Bone SED target:            {BONE_SED_TARGET:.4e} psi")
+        print(f"Initial SED coeff. of var.: {iteration_history[0]['SED_CoeffVariation']:.4f}")
+        print(f"Final SED coeff. of var.:   {iteration_history[-1]['SED_CoeffVariation']:.4f}  (lower = more uniform SED)")
+        print(f"Initial Total Volume:       {iteration_history[0]['Total_Volume_estimate']:.4f}")
+        print(f"Final Total Volume:         {iteration_history[-1]['Total_Volume_estimate']:.4f}")
         print(f"{'='*70}\n")
     
     return iteration_history, member_sections
